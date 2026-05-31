@@ -1,0 +1,33 @@
+{
+  "name": "lingua-muse",
+  "version": "6.5.2",
+  "description": "Lingua Muse - Language Atelier",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win portable"
+  },
+  "author": "Lingua Muse",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.linguamuse.app",
+    "productName": "Lingua Muse",
+    "win": {
+      "target": "portable",
+      "icon": "icon.ico",
+      "signAndEditExecutable": false
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html"
+    ],
+    "portable": {
+      "artifactName": "LinguaMuse.exe"
+    }
+  }
+}
