@@ -87,4 +87,11 @@ configure. Export or import your entire library as JSON anytime from **Settings*
 
 ## 📄 License
 
-MIT
+**PolyForm Noncommercial License 1.0.0** — see [LICENSE](LICENSE).
+
+This project is **source-available, not open source**. You are free to use,
+study, modify, and share it for any **noncommercial** purpose (personal use,
+study, hobby projects, education, nonprofits…). **Commercial use is not
+permitted** without a separate license from the author.
+
+© 2026 echo-yu2007
