@@ -231,7 +231,7 @@ function tokenizeForRead(text,langKey){
 
 let S={
   tab:LS.get('tab','read'),
-  api:LS.get('api',{endpoint:'',key:'',model:'',enabled:false}),
+  api:LS.get('api',{endpoint:'',key:'',model:'',enabled:false,maxTok:4096}),
   srcLang:LS.get('srcLang',DEFAULT_LANG),
   darkMode:LS.get('darkMode',false),
   wpSettings:LS.get('wpSettings',{enabled:false,sizeMode:'cover',fillColor:'#f5e6d8',fillMode:'auto'}),
@@ -348,7 +348,8 @@ function buildApiUrl(raw){
   // Try /v1/chat/completions first, but allow fallback
   return ep+'/v1/chat/completions';
 }
-async function callAPI(prompt,system,retries=2,force=false,maxTok=800){
+async function callAPI(prompt,system,retries=2,force=false,maxTok=0){
+  if(!maxTok)maxTok=S.api.maxTok||4096;
   const c=S.api;if(!c.endpoint)throw new Error('请先填写API端点');
   if(!c.enabled&&!force)throw new Error('API未连接');
   const url=buildApiUrl(c.endpoint);
@@ -356,7 +357,8 @@ async function callAPI(prompt,system,retries=2,force=false,maxTok=800){
     try{
       const h={'Content-Type':'application/json'};if(c.key)h['Authorization']='Bearer '+c.key;
       const body=JSON.stringify({model:c.model||'deepseek-chat',messages:[{role:'system',content:system},{role:'user',content:prompt}],max_tokens:maxTok,temperature:.2});
-      let r=await fetch(url,{method:'POST',headers:h,body});
+      const ac=new AbortController();const tid=setTimeout(()=>ac.abort(),120000);
+      let r;try{r=await fetch(url,{method:'POST',headers:h,body,signal:ac.signal})}finally{clearTimeout(tid)}
       // If /v1 path got 404, try without /v1
       if(r.status===404&&url.includes('/v1/')){
         const alt=url.replace('/v1/chat/completions','/chat/completions');
@@ -376,15 +378,31 @@ async function testAPI(){
   catch(e){S.api.enabled=false;saveApi();render();toast('失败: '+e.message);console.error('[API Test] Error:',e)}
 }
 
-/* ===== Robust JSON parser ===== */
+/* ===== Robust JSON parser (handles reasoning-model <think> + truncation) ===== */
+function repairTruncatedJSON(s){
+  let inStr=false,esc2=false;const stack=[];
+  for(let i=0;i<s.length;i++){
+    const ch=s[i];
+    if(inStr){if(esc2){esc2=false}else if(ch==='\\'){esc2=true}else if(ch==='"'){inStr=false}continue}
+    if(ch==='"')inStr=true;
+    else if(ch==='{'||ch==='[')stack.push(ch);
+    else if(ch==='}'||ch===']')stack.pop();
+  }
+  let out=s;if(inStr)out+='"';out=out.replace(/,\s*$/,'');
+  while(stack.length){const open=stack.pop();out+=(open==='{'?'}':']')}
+  return out;
+}
 function safeParseJSON(raw){
   if(!raw)return null;
-  try{return JSON.parse(raw)}catch{}
-  let s=raw.replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim();
+  let s=String(raw).replace(/<think>[\s\S]*?<\/think>/gi,'').replace(/<\/?think>/gi,'');
   try{return JSON.parse(s)}catch{}
-  const m=s.match(/\{[\s\S]*\}/);
-  if(m)try{return JSON.parse(m[0])}catch{}
-  if(m){let f=m[0].replace(/,\s*([}\]])/g,'$1').replace(/'/g,'"');try{return JSON.parse(f)}catch{}}
+  s=s.replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim();
+  try{return JSON.parse(s)}catch{}
+  const start=s.indexOf('{');if(start<0)return null;
+  let cand=s.slice(start);const lastClose=cand.lastIndexOf('}');
+  if(lastClose>0){const whole=cand.slice(0,lastClose+1);try{return JSON.parse(whole)}catch{}
+    try{return JSON.parse(whole.replace(/,\s*([}\]])/g,'$1'))}catch{}}
+  try{return JSON.parse(repairTruncatedJSON(cand).replace(/,\s*([}\]])/g,'$1'))}catch{}
   return null;
 }
 
@@ -416,9 +434,9 @@ const POS_MAP={noun:'n.',n:'n.',verb:'v.',v:'v.',vt:'v.',vi:'v.',adjective:'adj.
 function normPos(s){
   let t=stripMd(s).replace(/^(词性|part of speech|pos)\s*[:：\-—]?\s*/i,'').trim();
   if(!t)return '';
-  // Take the first listed pos, normalize each token.
+  // Strip parenthesized duplicates like "形容词（adjective）" and trailing junk
+  t=t.replace(/[（(][^）)]*[）)]/g,'').replace(/[\/／].*?(举例|搭配|用法|例句|:).*/i,'').trim();
   const parts=t.split(/[\/,，、;；\s]+/).filter(Boolean).map(p=>{const key=p.toLowerCase().replace(/\.$/,'');return POS_MAP[key]||POS_MAP[p]||p}).filter(Boolean);
-  // De-dup while preserving order, keep at most 2.
   const seen=new Set();const out=[];for(const p of parts){if(!seen.has(p)){seen.add(p);out.push(p)}if(out.length>=2)break}
   return out.join('/');
 }
@@ -481,7 +499,7 @@ async function lookupWord(word,contextText){
 
 Return ONLY this JSON (no markdown, no ** , no extra text):
 {"t":"中文释义(可多个义项,用;分隔)","p":"IPA音标如 /əˈnɒnɪməs/","pos":"词性缩写如 n./v./adj."${origSentence?',"orig_cn":"上面Context sentence的中文翻译"':''},"ex":[{"s":"权威词典例句","tr":"该例句中文翻译","src":"Oxford English Dictionary"},{"s":"第二个权威例句","tr":"该例句中文翻译","src":"Cambridge Dictionary"}]}`;
-      const r=await callAPI(prompt,`你是${langName}→中文词典。严格只输出JSON,禁止markdown/星号/解释。t=纯中文释义。pos=词性缩写。ex必须是2个权威词典(英语:Oxford/Cambridge;日语:広辞苑/大辞林;韩语:표준국어대사전)真实例句,每句配中文翻译tr和来源src。`,1,true,600);
+      const r=await callAPI(prompt,`你是${langName}→中文词典。严格只输出JSON,禁止markdown/星号/解释。t=纯中文释义。pos=词性缩写。ex必须是2个权威词典(英语:Oxford/Cambridge;日语:広辞苑/大辞林;韩语:표준국어대사전)真实例句,每句配中文翻译tr和来源src。`,1,true);
       if(!r||!r.trim()){if(i<1){await _delay(400);continue}break}
       const info=parseLookup(r,k,origSentence);
       if(ok(info))return cacheWord(k,info);
@@ -681,7 +699,7 @@ async function batchLookupWords(words,lang){
 
 Return ONLY a JSON array (no markdown, no ** ), one object per word:
 [{"w":"the exact word","t":"中文释义","p":"IPA音标","pos":"词性缩写如 n./v./adj.","ex":[{"s":"权威词典例句","tr":"中文翻译","src":"Oxford English Dictionary"},{"s":"第二个权威例句","tr":"中文翻译","src":"Cambridge Dictionary"}]}]`;
-  const r=await callAPI(prompt,`你是${langName}→中文批量词典。严格只输出JSON数组,禁止markdown/星号。每个词:t=纯中文释义,pos=词性缩写,ex=2个权威词典真实例句配中文翻译tr和来源src。`,1,true,Math.min(words.length*240,3200));
+  const r=await callAPI(prompt,`你是${langName}→中文批量词典。严格只输出JSON数组,禁止markdown/星号。每个词:t=纯中文释义,pos=词性缩写,ex=2个权威词典真实例句配中文翻译tr和来源src。`,1,true);
   let arr=safeParseJSON(r);
   if(!Array.isArray(arr)){const m=(r||'').match(/\[[\s\S]*\]/);if(m)try{arr=JSON.parse(m[0])}catch{arr=null}}
   if(!Array.isArray(arr))return{};
@@ -763,7 +781,10 @@ function flashResult(known){const fw=S.flashQueue[S.flashIdx];if(!fw)return;for(
 function buildDict(){let all=flashFilterWords();all=all.filter(w=>w.status!=='mastered'||w.reviewCount<3);all.sort(()=>Math.random()-.5);S.dictQueue=all.slice(0,30);S.dictIdx=0;S.dictInput='';S.dictResult=null}
 function checkDict(){const dw=S.dictQueue[S.dictIdx];if(!dw)return;const ok=S.dictInput.trim().toLowerCase()===dw.word.toLowerCase();S.dictResult=ok?'ok':'no';for(const b of S.books)for(const g of b.groups){const w=g.words.find(x=>x.word===dw.word);if(w){w.reviewCount++;w.lastReview=Date.now();if(!ok){w.wrongCount++;if(w.wrongCount>=3)w.starred=true}else if(w.reviewCount>=3)w.status='mastered';break}}saveBooks();render()}
 function nextDict(){S.dictIdx++;S.dictInput='';S.dictResult=null;if(S.dictIdx>=S.dictQueue.length)toast('默写完成');render()}
-function delWord(bookId,gId,w){const b=S.books.find(x=>x.id===bookId)||getBook();const g=b.groups.find(x=>x.id===gId);if(g){g.words=g.words.filter(x=>x.word!==w);saveBooks();render()}}
+function delWord(bookId,gId,w){const b=S.books.find(x=>x.id===bookId)||getBook();const g=b.groups.find(x=>x.id===gId);if(g){g.words=g.words.filter(x=>x.word!==w);saveBooks()}
+  forgetWord(w);render()}
+function forgetWord(word){const k=(word||'').toLowerCase().trim();if(S.wordCache[k]){delete S.wordCache[k];saveWordCache()}
+  const i=S.readWordList.findIndex(x=>x.word.toLowerCase()===k);if(i>=0){S.readWordList.splice(i,1);saveLastRead()}}
 function moveWord(fromGid,w,toGid){const b=getBook();const fg=b.groups.find(x=>x.id===fromGid);const tg=b.groups.find(x=>x.id===toGid);if(!fg||!tg)return;const i=fg.words.findIndex(x=>x.word===w);if(i===-1)return;const[wd]=fg.words.splice(i,1);tg.words.push(wd);saveBooks();render();toast('已移动')}
 function exportReadWords(fmt){
   const loaded=S.readWordList.filter(w=>w.info);if(!loaded.length)return;let content='',filename='',mime='';
@@ -956,6 +977,7 @@ function rReadDetail(){
       <span style="font-family:var(--serif);font-size:17px;font-weight:700;color:var(--accentText)">${esc(w.word)}</span>
       ${w.info.phonetic?`<span style="font-size:11px;color:var(--textMuted)">${esc(w.info.phonetic)}</span>`:''}
       ${w.info.pos?`<span class="pill" style="background:var(--accentSoft);color:var(--accent)">${esc(w.info.pos)}</span>`:''}
+      <button class="btn btn-ghost btn-sm" data-requery="${esc(w.word)}" title="清除记忆并重新查询" style="margin-left:auto;font-size:10px;color:var(--accent)">&#8635; 重查</button>
     </div>
     ${w.info.meaning_en?`<div style="font-size:13px;color:var(--textSecondary);line-height:1.5;margin-bottom:4px">${esc(w.info.meaning_en)}</div>`:''}
     <div style="font-family:var(--serif);font-size:14px;color:var(--amber);font-weight:500;margin-bottom:10px">${esc(w.info.meaning_cn||w.info.translation||'')}</div>
@@ -1204,7 +1226,8 @@ function rSettings(){
       <div style="font-family:var(--serif);font-size:15px;font-weight:600;margin-bottom:16px">API 连接</div>
       <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--textMuted);display:block;margin-bottom:4px;font-weight:600;letter-spacing:.5px">ENDPOINT</label><input class="input" id="ae" value="${esc(S.api.endpoint)}" placeholder="https://api.deepseek.com"></div>
       <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--textMuted);display:block;margin-bottom:4px;font-weight:600;letter-spacing:.5px">API KEY</label><input class="input" id="ak" type="password" value="${esc(S.api.key)}" placeholder="sk-..."></div>
-      <div style="margin-bottom:16px"><label style="font-size:10px;color:var(--textMuted);display:block;margin-bottom:4px;font-weight:600;letter-spacing:.5px">MODEL</label><input class="input" id="am" value="${esc(S.api.model)}" placeholder="deepseek-chat / gpt-4o-mini ..."></div>
+      <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--textMuted);display:block;margin-bottom:4px;font-weight:600;letter-spacing:.5px">MODEL</label><input class="input" id="am" value="${esc(S.api.model)}" placeholder="deepseek-chat / gpt-4o-mini ..."></div>
+      <div style="margin-bottom:16px"><label style="font-size:10px;color:var(--textMuted);display:block;margin-bottom:4px;font-weight:600;letter-spacing:.5px">MAX TOKENS <span style="font-weight:400;opacity:.7">（推理模型建议 4096~8192）</span></label><input class="input" id="amt" type="number" value="${S.api.maxTok||4096}" placeholder="4096" style="width:140px"></div>
       <div style="display:flex;gap:8px;align-items:center">
         <button class="btn btn-primary" id="sab">保存</button>
         <button class="btn btn-outline" id="tab2">测试</button>
@@ -1269,7 +1292,7 @@ function rSettings(){
       <input type="file" id="ifi" accept=".json" style="display:none">
     </div>
     <div class="card"><div class="section-label">ABOUT</div>
-      <div style="font-size:11px;color:var(--textMuted);line-height:1.8">Lingua Muse v6.5.2 / 释义全部由 API 生成 / 数据持久化存储于 ${esc((typeof window!=='undefined'&&window.LMStore&&window.LMStore.dataPath)||'本地')}</div>
+      <div style="font-size:11px;color:var(--textMuted);line-height:1.8">Lingua Muse v6.6.2 / 释义全部由 API 生成 / 数据持久化存储于 ${esc((typeof window!=='undefined'&&window.LMStore&&window.LMStore.dataPath)||'本地')}</div>
     </div>
   </div>`}
 
@@ -1333,6 +1356,7 @@ function bindEvents(){
   document.querySelectorAll('[data-rw]').forEach(el=>el.onclick=()=>readWordClick(el.dataset.rwd,+el.dataset.rw));
   // Retry failed word lookups
   document.querySelectorAll('[data-retry]').forEach(el=>el.onclick=()=>{const w=el.dataset.retry;delete S.wordCache[w.toLowerCase()];readWordClick(w,-1)});
+  document.querySelectorAll('[data-requery]').forEach(el=>el.onclick=()=>{const w=el.dataset.requery;forgetWord(w);readWordClick(w,-1)});
   const sb=document.getElementById('sumBtn');if(sb)sb.onclick=summarize;
   // File
   const fdz=document.getElementById('fileDropZone');const fi=document.getElementById('fileInput');
@@ -1351,7 +1375,7 @@ function bindEvents(){
   const nbb=document.getElementById('nbb');if(nbb)nbb.onclick=()=>{const lang=S.srcLang;const name=getLangLabel(lang)+' 词汇本'+(S.books.filter(b=>b.lang===lang).length+1);S.books.push({id:Date.now(),name,lang,groups:[{id:Date.now()+1,name:'未分组',words:[]}]});S.currentBookIdx=S.books.length-1;saveBooks();saveBookIdx();render()};
   const dbb=document.getElementById('dbb');if(dbb)dbb.onclick=()=>{if(S.books.length<=1){toast('至少保留一个词汇本');return}const b=getBook();if(!confirm(`删除词汇本 "${b.name}"？其中 ${getAllWords(b).length} 个单词将丢失。`))return;S.books.splice(S.currentBookIdx,1);S.currentBookIdx=Math.min(S.currentBookIdx,S.books.length-1);saveBooks();saveBookIdx();render();toast('已删除')};
   const imb=document.getElementById('imb');if(imb)imb.onclick=()=>{S.showImportModal=true;render()};
-  const agb=document.getElementById('agb');if(agb)agb.onclick=()=>{const n=prompt('分组名:');if(n?.trim()){getBook().groups.push({id:Date.now(),name:n.trim(),words:[]});saveBooks();render()}};
+  const agb=document.getElementById('agb');if(agb)agb.onclick=()=>{const b=getBook();let n='新分组',c=2;while(b.groups.some(g=>g.name===n)){n='新分组'+c++}const gid=Date.now();b.groups.push({id:gid,name:n,words:[]});S.editingGroupName=gid;saveBooks();render();const inp=document.querySelector(`[data-gni="${gid}"]`);if(inp){inp.focus();inp.select()}};
   const awb=document.getElementById('awb');if(awb)awb.onclick=()=>{S.showAddWordModal=true;render()};
   const afb=document.getElementById('afb');if(afb)afb.onclick=autoFill;
   const bsi=document.getElementById('bsi');if(bsi)bsi.oninput=()=>{S.bookSearch=bsi.value;render()};
@@ -1383,8 +1407,9 @@ function bindEvents(){
   const rdb=document.getElementById('rdb');if(rdb)rdb.onclick=()=>{S.dictQueue=[];render()};
   const edb=document.getElementById('edb');if(edb)edb.onclick=()=>{S.dictQueue=[];render()};
   // Settings
-  const sab=document.getElementById('sab');if(sab)sab.onclick=()=>{S.api.endpoint=(document.getElementById('ae')?.value||'').trim();S.api.key=(document.getElementById('ak')?.value||'').trim();S.api.model=(document.getElementById('am')?.value||'').trim();saveApi();toast('已保存')};
-  const tab2=document.getElementById('tab2');if(tab2)tab2.onclick=()=>{S.api.endpoint=(document.getElementById('ae')?.value||'').trim();S.api.key=(document.getElementById('ak')?.value||'').trim();S.api.model=(document.getElementById('am')?.value||'').trim();saveApi();testAPI()};
+  const _readApiForm=()=>{S.api.endpoint=(document.getElementById('ae')?.value||'').trim();S.api.key=(document.getElementById('ak')?.value||'').trim();S.api.model=(document.getElementById('am')?.value||'').trim();S.api.maxTok=Math.max(100,+(document.getElementById('amt')?.value)||4096)};
+  const sab=document.getElementById('sab');if(sab)sab.onclick=()=>{_readApiForm();saveApi();toast('已保存')};
+  const tab2=document.getElementById('tab2');if(tab2)tab2.onclick=()=>{_readApiForm();saveApi();testAPI()};
   const dab=document.getElementById('dab');if(dab)dab.onclick=()=>{S.api.enabled=false;saveApi();render();toast('已断开')};
   // Wallpaper events
   const wpUpload=document.getElementById('wpUpload');const wpFileInput=document.getElementById('wpFileInput');const wpPreview=document.getElementById('wpPreview');

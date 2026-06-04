@@ -1,4 +1,4 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -40,7 +40,11 @@ function createWindow() {
   win.loadFile('index.html');
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  // Bypass system/VPN proxy — API calls go direct, much faster with VPN on.
+  try { session.defaultSession.setProxy({ mode: 'direct' }); } catch (e) {}
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   app.quit();
